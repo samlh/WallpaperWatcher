@@ -63,7 +63,7 @@ namespace WallpaperWatcher
             var trayIcon = new NotifyIcon()
             {
                 Text = "Wallpaper Watcher",
-                Icon = new Icon(SystemIcons.Application, 40, 40),
+                Icon = new Icon(typeof(Program), "Icon.ico"),
                 ContextMenuStrip = trayMenu,
                 Visible = true
             };
