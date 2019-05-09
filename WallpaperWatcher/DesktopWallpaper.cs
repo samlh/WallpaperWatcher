@@ -99,15 +99,15 @@ namespace WallpaperWatcher
         void SetSlideshow(IntPtr items);
         IntPtr GetSlideshow();
 
-        void SetSlideshowOptions(DesktopSlideshowDirection options, uint slideshowTick);
+        void SetSlideshowOptions(DesktopSlideshowOptions options, uint slideshowTick);
 
         [PreserveSig]
-        uint GetSlideshowOptions(out DesktopSlideshowDirection options, out uint slideshowTick);
+        uint GetSlideshowOptions(out DesktopSlideshowOptions options, out uint slideshowTick);
 
         void AdvanceSlideshow([MarshalAs(UnmanagedType.LPWStr)] string monitorID,
                               [MarshalAs(UnmanagedType.I4)] DesktopSlideshowDirection direction);
 
-        DesktopSlideshowDirection GetStatus();
+        DesktopSlideshowState GetStatus();
 
         bool Enable();
     }
