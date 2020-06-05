@@ -1,17 +1,22 @@
 using System;
 using System.Collections.Generic;
 using System.Configuration;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using WallpaperWatcher;
 
-class WallpaperChanger
+public class WallpaperChanger
 {
     const int ThumbSize = 120;
     const decimal ImageSideFractionToAnalyze = 0.4m;
     const decimal TiedColorDifferenceMargin = 0.08m;
-    const int ColorBits = 4;
+
+    const int Bits = 4;
+    const int BitsMask = (1 << Bits) - 1;
+    const int BitsRemoved = 8 - Bits;
+    const int BitsRemovedMask = (1 << BitsRemoved) - 1;
 
     readonly decimal maxScaleFactor;
     readonly decimal skipScaleFactor;
@@ -20,6 +25,7 @@ class WallpaperChanger
 
     string currentFile;
     StringWriter debugData;
+    Stopwatch stopWatch;
 
     public event EventHandler WallpaperChanged;
 
@@ -38,61 +44,43 @@ class WallpaperChanger
                         .Select(f => f.FullName))
             .AsParallel()
             .ToList();
+        this.stopWatch = new Stopwatch();
     }
 
     public void UpdateWallpaper()
     {
         this.debugData = new StringWriter();
+        this.stopWatch.Restart();
         while (fileList.Any())
         {
             var wallpaperLocation = fileList[new Random().Next(fileList.Count)];
-            this.debugData.WriteLine("{0}", wallpaperLocation);
+            WriteLine($"Loading file {wallpaperLocation}");
 
-            Bitmap img;
-            try
+            var (style, bgColor) = GetStyleAndBgColor(wallpaperLocation);
+            if (style == null)
             {
-                img = new Bitmap(wallpaperLocation);
-            }
-            catch (Exception)
-            {
-                this.debugData.WriteLine("File not read, skipping: {0}", wallpaperLocation);
                 fileList.Remove(wallpaperLocation);
-
                 continue;
-            }
-
-            DesktopWallpaperPosition? style;
-            Color? bgColor = null;
-
-            using (img)
-            {
-                style = GetWallpaperStyle(img, out var matchHorz, out var matchVert);
-                if (style == null)
-                {
-                    fileList.Remove(wallpaperLocation);
-                    continue;
-                }
-
-                if (style != DesktopWallpaperPosition.Fill)
-                {
-                    bgColor = GetBGColor(img, matchHorz, matchVert);
-                }
             }
 
             this.currentFile = wallpaperLocation;
 
-            var wallpaper = (IDesktopWallpaper)new DesktopWallpaperClass();
+            var desktopWallpaper = (IDesktopWallpaper)new DesktopWallpaperClass();
 
-            wallpaper.SetPosition(style.Value);
+            desktopWallpaper.SetPosition(style.Value);
+            WriteLine("Set position");
 
             if (bgColor.HasValue)
             {
-                wallpaper.SetBackgroundColor((uint)ColorTranslator.ToWin32(bgColor.Value));
+                desktopWallpaper.SetBackgroundColor((uint)ColorTranslator.ToWin32(bgColor.Value));
+                WriteLine("Set bg color");
             }
 
-            for (uint i = 0; i < wallpaper.GetMonitorDevicePathCount(); i++)
+            for (uint i = 0; i < desktopWallpaper.GetMonitorDevicePathCount(); i++)
             {
-                wallpaper.SetWallpaper(wallpaper.GetMonitorDevicePathAt(i), wallpaperLocation);
+                var monitorID = desktopWallpaper.GetMonitorDevicePathAt(i);
+                desktopWallpaper.SetWallpaper(monitorID, wallpaperLocation);
+                WriteLine($"Set wallpaper on monitor {i}: {monitorID}");
             }
 
             WallpaperChanged?.Invoke(null, null);
@@ -113,21 +101,64 @@ class WallpaperChanger
         return this.debugData.ToString();
     }
 
-    private DesktopWallpaperPosition? GetWallpaperStyle(Image img, out bool matchLeftAndRight, out bool matchTopAndBottom)
+    private void WriteLine(string message)
+    {
+        this.debugData.WriteLine($"{this.stopWatch.ElapsedMilliseconds}: {message}");
+    }
+
+    private (DesktopWallpaperPosition? style, Color? bgColor) GetStyleAndBgColor(string wallpaperLocation)
+    {
+        Bitmap img;
+        try
+        {
+            // Note: this is the slowest line of the program
+            img = new Bitmap(wallpaperLocation);
+            WriteLine("Opened file");
+        }
+        catch (Exception)
+        {
+            WriteLine("File not read, skipping");
+            return (null, null);
+        }
+
+        var style = GetWallpaperStyle(img.Size, out var matchLeftAndRight, out var matchTopAndBottom);
+
+        PixelBuffer pixelBuffer = null;
+        using (img)
+        {
+            if (style == null || style == DesktopWallpaperPosition.Fill)
+            {
+                return (style, null);
+            }
+
+            using (var thumb = img.GetThumbnailImage(ThumbSize, ThumbSize, () => false, IntPtr.Zero) as Bitmap)
+            {
+                WriteLine("Got thumbnail");
+                pixelBuffer = new PixelBuffer(thumb);
+                WriteLine("Got pixel buffer");
+            }
+        }
+
+        WriteLine("Closed file");
+        var bgColor = GetBGColor(pixelBuffer, matchLeftAndRight, matchTopAndBottom);
+        return (style, bgColor);
+    }
+
+    private DesktopWallpaperPosition? GetWallpaperStyle(Size size, out bool matchLeftAndRight, out bool matchTopAndBottom)
     {
         var screenSize = MiscWindowsAPIs.GetScreenSize();
 
-        var widthScaleFactor = (decimal)screenSize.Width / img.Width;
-        var heightScaleFactor = (decimal)screenSize.Height / img.Height;
+        var widthScaleFactor = (decimal)screenSize.Width / size.Width;
+        var heightScaleFactor = (decimal)screenSize.Height / size.Height;
 
         var fitScaleFactor = Math.Min(widthScaleFactor, heightScaleFactor);
         var fillScaleFactor = Math.Max(widthScaleFactor, heightScaleFactor);
 
         var fillFractionOffscreen = 1m - Math.Min(widthScaleFactor / heightScaleFactor, heightScaleFactor / widthScaleFactor);
 
-        this.debugData.WriteLine($"w={img.Width} h={img.Height} sw={screenSize.Width} sh={screenSize.Height}");
-        this.debugData.WriteLine($"fitScaleFactor={fitScaleFactor:F2} fillScaleFactor={fillScaleFactor:F2}");
-        this.debugData.WriteLine($"fillFractionOffscreen={fillFractionOffscreen:F2}");
+        this.WriteLine($"w={size.Width} h={size.Height} sw={screenSize.Width} sh={screenSize.Height}");
+        this.WriteLine($"fitScaleFactor={fitScaleFactor:F2} fillScaleFactor={fillScaleFactor:F2}");
+        this.WriteLine($"fillFractionOffscreen={fillFractionOffscreen:F2}");
 
         DesktopWallpaperPosition? style;
 
@@ -151,105 +182,146 @@ class WallpaperChanger
         matchLeftAndRight = style == DesktopWallpaperPosition.Center || (style == DesktopWallpaperPosition.Fit && widthScaleFactor > heightScaleFactor);
         matchTopAndBottom = style == DesktopWallpaperPosition.Center || (style == DesktopWallpaperPosition.Fit && heightScaleFactor > widthScaleFactor);
 
-        this.debugData.WriteLine($"style={style}");
-        this.debugData.WriteLine($"matchLeftAndRight={matchLeftAndRight} matchTopAndBottom={matchTopAndBottom}");
+        this.WriteLine($"style={style}");
+        this.WriteLine($"matchLeftAndRight={matchLeftAndRight} matchTopAndBottom={matchTopAndBottom}");
 
         return style;
     }
 
-    private Color? GetBGColor(Image img, bool matchLeftAndRight, bool matchTopAndBottom)
+    private Color? GetBGColor(PixelBuffer pixelBuffer, bool matchLeftAndRight, bool matchTopAndBottom)
     {
-        Color chosen;
+        var (rect1, rect2) = GetRectsToAnalyze(pixelBuffer.Size, matchLeftAndRight, matchTopAndBottom);
 
-        using (var thumb = img.GetThumbnailImage(ThumbSize, ThumbSize, () => false, IntPtr.Zero) as Bitmap)
+        var histogram = new int[1 << Bits << Bits << Bits];
+        AddToHistogram(pixelBuffer, rect1, histogram);
+        AddToHistogram(pixelBuffer, rect2, histogram);
+        WriteLine("Computed histogram");
+
+        var histogramBuckets = Enumerable.Range(0, histogram.Length).ToArray();
+        Array.Sort(histogram, histogramBuckets, Comparer<int>.Create((x, y) => y.CompareTo(x)));
+
+        var maxFrequency = histogram[0];
+        var minFrequencyOk = (int)Math.Floor(maxFrequency * TiedColorDifferenceMargin);
+        this.WriteLine($"maxFrequency={maxFrequency} minFrequencyOk={minFrequencyOk}");
+
+        var bucketCount = Array.FindIndex(histogram, n => n < minFrequencyOk);
+        if (bucketCount == -1)
         {
-            if (thumb == null || thumb.Width == 0 || thumb.Height == 0)
-            {
-                return null;
-            }
-
-            var histogramValues = new List<Color>[1 << ColorBits << ColorBits << ColorBits];
-
-            for (var x = 0; x < thumb.Width; x++)
-            {
-                for (var y = 0; y < thumb.Width; y++)
-                {
-                    if (matchLeftAndRight && OutsideCenterFraction(x, thumb.Width, ImageSideFractionToAnalyze)
-                     || matchTopAndBottom && OutsideCenterFraction(y, thumb.Height, ImageSideFractionToAnalyze))
-                    {
-                        var c = thumb.GetPixel(x, y);
-                        var b = ColorToBucket(c, ColorBits);
-                        if (histogramValues[b] == null)
-                        {
-                            histogramValues[b] = new List<Color>();
-                        }
-                        histogramValues[b].Add(c);
-                    }
-                }
-            }
-
-            var histogram = new int[1 << ColorBits << ColorBits << ColorBits];
-            var histogramValue = new Color[1 << ColorBits << ColorBits << ColorBits];
-
-            for (var i = 0; i < histogramValues.Length; i++)
-            {
-                var bucket = histogramValues[i];
-                if (bucket != null)
-                {
-                    histogram[i] = bucket.Count();
-                    histogramValue[i] = bucket.GroupBy(c => ColorToBucket(c, ColorBits + 2)).OrderByDescending(g => g.Count()).First().First();
-                }
-            }
-
-            var orderedHist = histogram
-                .Select((n, i) => (n, i))
-                .Where(b => b.n != 0)
-                .OrderByDescending(b => b.n)
-                .Select(b => (b.n, c: histogramValue[b.i]))
-                .ToArray();
-
-            if (!orderedHist.Any())
-            {
-                return null;
-            }
-
-            var maxFrequency = orderedHist.First().n;
-            var minFrequencyOk = (int)Math.Floor(maxFrequency * TiedColorDifferenceMargin);
-            this.debugData.WriteLine($"maxFrequency={maxFrequency} minFrequencyOk={minFrequencyOk}");
-
-            var tiedForBest = orderedHist
-                .TakeWhile(bucket => bucket.n >= minFrequencyOk)
-                .Select(bucket => (bucket.n, bucket.c, l: GetL(bucket.c)))
-                .OrderBy(bucket => Math.Round(bucket.l * 8))
-                .ThenBy(bucket => Math.Round(bucket.c.GetSaturation() * 8))
-                .ThenBy(bucket => bucket.l)
-                .ToArray();
-
-            foreach (var bucket in tiedForBest)
-            {
-                this.debugData.WriteLine($"{bucket.c.ToArgb():X} s={bucket.c.GetSaturation():F2} v={bucket.c.GetBrightness():F2} l={bucket.l:F2} {bucket.n}");
-            }
-
-            chosen = tiedForBest[0].c;
-
-            this.debugData.WriteLine($"chosen: {chosen.ToArgb():X}");
+            bucketCount = histogram.Length;
         }
 
+        // TODO: slow on first execution
+        var tiedForBest = histogram
+            .Take(bucketCount)
+            .Zip(histogramBuckets, (n, bucket) =>
+            {
+                var c = BucketToColor(bucket);
+                var s = c.GetSaturation();
+                var b = c.GetBrightness();
+                var l = (2 - s) * b / 2;
+                return (n, c, s, b, l);
+            })
+            .OrderBy(bucket => Math.Round(bucket.l * 8))
+            .ThenBy(bucket => Math.Round(bucket.s * 8))
+            .ThenBy(bucket => bucket.l)
+            .ToArray();
+
+        foreach (var bucket in tiedForBest)
+        {
+            this.WriteLine($"{bucket.c.ToArgb():X} s={bucket.s:F2} v={bucket.b:F2} l={bucket.l:F2} {bucket.n}");
+        }
+
+        var chosenCoarse = tiedForBest[0].c;
+
+        var finalColorHist = new int[1 << BitsRemoved << BitsRemoved << BitsRemoved];
+        AddToSubbucketHistogram(pixelBuffer, rect1, chosenCoarse, finalColorHist);
+        AddToSubbucketHistogram(pixelBuffer, rect2, chosenCoarse, finalColorHist);
+
+        WriteLine("Computed final histogram");
+
+        var finalColorHistBuckets = Enumerable.Range(0, finalColorHist.Length).ToArray();
+        Array.Sort(finalColorHist, finalColorHistBuckets, Comparer<int>.Create((x, y) => y.CompareTo(x)));
+
+        var adjustment = finalColorHistBuckets[0];
+        var chosen = ApplySubbucketAdjustment(chosenCoarse, adjustment);
+
+        this.WriteLine($"chosen: {chosen.ToArgb():X} (coarse {chosenCoarse.ToArgb():X})");
         return chosen;
     }
 
-    private static bool OutsideCenterFraction(int v, int max, decimal fraction)
+    private static (Rectangle, Rectangle) GetRectsToAnalyze(Size size, bool matchLeftAndRight, bool matchTopAndBottom)
     {
-        return Math.Abs(v - max / 2) * 2 >= max - max * fraction;
+        if (matchLeftAndRight)
+        {
+            var w = (int)Math.Floor(size.Width * ImageSideFractionToAnalyze / 2);
+            return (new Rectangle(0, 0, w, size.Height), new Rectangle(size.Width - w, 0, w, size.Height));
+        }
+        else if (matchTopAndBottom)
+        {
+            var h = (int)Math.Floor(size.Height * ImageSideFractionToAnalyze / 2);
+            return (new Rectangle(0, 0, size.Width, h), new Rectangle(0, size.Height - h, size.Width, h));
+        }
+
+        return (new Rectangle(0, 0, 0, 0), new Rectangle(0, 0, 0, 0));
     }
 
-    private static float GetL(Color color)
+    private static void AddToHistogram(PixelBuffer pixelBuffer, Rectangle rect, int[] histogram)
     {
-        return (2 - color.GetSaturation()) * color.GetBrightness() / 2;
+        for (var y = rect.Top; y < rect.Bottom; y++)
+        {
+            for (var x = rect.Left; x < rect.Right; x++)
+            {
+                var bucket = ColorToBucket(pixelBuffer.GetPixel(x, y));
+                histogram[bucket]++;
+            }
+        }
     }
 
-    private static int ColorToBucket(Color c, int bits)
+    private static void AddToSubbucketHistogram(PixelBuffer pixelBuffer, Rectangle rect, Color coarseColor, int[] histogram)
     {
-        return (c.R >> (8 - bits) << bits << bits) | (c.G >> (8 - bits) << bits) | (c.B >> (8 - bits));
+        var bucket = ColorToBucket(coarseColor);
+        for (var y = rect.Top; y < rect.Bottom; y++)
+        {
+            for (var x = rect.Left; x < rect.Right; x++)
+            {
+                var color = pixelBuffer.GetPixel(x, y);
+                if (bucket == ColorToBucket(color))
+                {
+                    var subbucket = ColorToSubbucket(color);
+                    histogram[subbucket]++;
+                }
+            }
+        }
+    }
+
+    private static int ColorToBucket(Color c)
+    {
+        return c.R >> BitsRemoved << Bits << Bits
+             | c.G >> BitsRemoved << Bits
+             | c.B >> BitsRemoved;
+    }
+
+    private static int ColorToSubbucket(Color c)
+    {
+        return (c.R & BitsRemovedMask) << BitsRemoved << BitsRemoved
+             | (c.G & BitsRemovedMask) << BitsRemoved
+             | (c.B & BitsRemovedMask);
+    }
+
+    private static Color BucketToColor(int bucket)
+    {
+        return Color.FromArgb(
+            (bucket >> Bits >> Bits) << BitsRemoved,
+            (bucket >> Bits & BitsMask) << BitsRemoved,
+            (bucket & BitsMask) << BitsRemoved);
+    }
+
+    private static Color ApplySubbucketAdjustment(Color color, int adjustment)
+    {
+        var r = adjustment >> BitsRemoved >> BitsRemoved;
+        var g = adjustment >> BitsRemoved & BitsRemovedMask;
+        var b = adjustment & BitsRemovedMask;
+
+        return Color.FromArgb(color.R + r, color.G + g, color.B + b);
     }
 }
